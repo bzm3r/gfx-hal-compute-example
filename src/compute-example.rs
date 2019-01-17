@@ -10,6 +10,8 @@ extern crate glsl_to_spirv;
 extern crate rand;
 extern crate shaderc;
 extern crate winit;
+#[macro_use]
+extern crate lazy_static;
 
 // thanks to @msiglreith, @omni-viral, @termhn, @aleksijuvani, @grovesNL on gfx-rs/ash gitter!
 
@@ -19,14 +21,32 @@ use hal::{
 };
 use std::{mem, ptr};
 
+lazy_static! {
+    static ref START_TIME: std::time::Instant = std::time::Instant::now();
+}
+
+fn log_elapsed(text: &str) {
+    let elapsed = START_TIME.elapsed();
+    let elapsed = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64) * 1e-9;
+    println!("{}: {}ms", text, elapsed * 1e3);
+}
+
 fn main() {
+    log_elapsed("start");
     env_logger::init();
     unsafe {
+        log_elapsed("init...");
         let mut application = ComputeApplication::init();
+        log_elapsed("fill_payload...");
+
         application.fill_payload();
+        log_elapsed("execute_compute...");
         application.execute_compute();
+        log_elapsed("check_result...");
         application.check_result();
+        log_elapsed("clean_up...");
         application.clean_up();
+        log_elapsed("done...");
     }
 }
 
@@ -43,7 +63,7 @@ impl QueueFamilyIds {
 
 struct ComputeApplication {
     command_buffer:
-        command::CommandBuffer<back::Backend, Compute, command::OneShot, command::Primary>,
+    command::CommandBuffer<back::Backend, Compute, command::OneShot, command::Primary>,
     command_pool: pool::CommandPool<back::Backend, Compute>,
     descriptor_pool: <back::Backend as Backend>::DescriptorPool,
     compute_pipeline: <back::Backend as Backend>::ComputePipeline,
@@ -64,6 +84,7 @@ impl ComputeApplication {
     unsafe fn init() -> ComputeApplication {
         let instance = ComputeApplication::create_instance();
         let mut adapter = ComputeApplication::pick_adapter(&instance);
+        log_elapsed("adapter picked");
         let (device, command_queues, queue_type, qf_id) =
             ComputeApplication::create_device_with_compute_queue(&mut adapter);
         let (buffer_length, buffer_size, memory, in_buffer, out_buffer, host_memory) =
@@ -108,7 +129,10 @@ impl ComputeApplication {
     }
 
     fn create_instance() -> back::Instance {
-        back::Instance::create("compute-example", 1)
+        log_elapsed("creating instance...");
+        let instance = back::Instance::create("compute-example", 1);
+        log_elapsed("done");
+        instance
     }
 
     fn find_queue_families(adapter: &Adapter<back::Backend>) -> QueueFamilyIds {
@@ -132,7 +156,12 @@ impl ComputeApplication {
     }
 
     fn pick_adapter(instance: &back::Instance) -> Adapter<back::Backend> {
-        let adapters = instance.enumerate_adapters();
+        /*
+        for adapter in instance.enumerate_adapters() {
+            println!("adapter: {:?}", adapter.info);
+        }
+        */
+        let mut adapters = instance.enumerate_adapters();
         for adapter in adapters {
             if ComputeApplication::is_adapter_suitable(&adapter) {
                 return adapter;
@@ -149,6 +178,9 @@ impl ComputeApplication {
         queue::QueueType,
         queue::family::QueueFamilyId,
     ) {
+//        for family in &adapter.queue_families {
+//            log_elapsed(&format!("family: {:?}", family));
+//        }
         let family = adapter
             .queue_families
             .iter()
@@ -164,6 +196,7 @@ impl ComputeApplication {
                 .open(&families, Features::empty())
                 .expect("Could not create device.")
         };
+        log_elapsed("device opened");
 
         let mut queue_group = queues
             .take::<Compute>(family.id())
@@ -209,9 +242,9 @@ impl ComputeApplication {
                 mem_type
                     .properties
                     .contains(memory::Properties::CPU_VISIBLE | memory::Properties::COHERENT)
-                && in_buffer_req.type_mask & (1 << id) != 0
-                && out_buffer_req.type_mask & (1 << id) != 0
-                && memory_size < memory_properties.memory_heaps[mem_type.heap_index]
+                    && in_buffer_req.type_mask & (1 << id) != 0
+                    && out_buffer_req.type_mask & (1 << id) != 0
+                    && memory_size < memory_properties.memory_heaps[mem_type.heap_index]
             })
             .unwrap()
             .into();
@@ -250,7 +283,7 @@ impl ComputeApplication {
         <back::Backend as Backend>::ComputePipeline,
     ) {
         let source = "#version 450
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0, std430) buffer _4_2
 {
@@ -262,11 +295,14 @@ layout(binding = 1, std430) buffer _4_3
     int a[16384];
 } output_buff;
 
+shared int foo;
+
 void main()
 {
-    output_buff.a[gl_GlobalInvocationID.x] = input_buff.a[gl_GlobalInvocationID.x];
+    output_buff.a[gl_GlobalInvocationID.x] = int(gl_LocalInvocationID.x);
 }";
 
+        log_elapsed("compiling...");
         let mut compiler = shaderc::Compiler::new().unwrap();
         let compilation_result = compiler
             .compile_into_spirv(
@@ -277,6 +313,7 @@ void main()
                 None,
             )
             .unwrap();
+        log_elapsed(&format!("done: {} bytes", compilation_result.as_binary_u8().len()));
 
         let shader_module = device
             .create_shader_module(compilation_result.as_binary_u8())
@@ -365,7 +402,7 @@ void main()
         };
 
         let mut descriptor_pool = device
-            .create_descriptor_pool(1, vec![&descriptor_pool_size])
+            .create_descriptor_pool(1, &[descriptor_pool_size])
             .unwrap();
 
         let descriptor_set = descriptor_pool.allocate_set(descriptor_set_layout).unwrap();
@@ -385,14 +422,14 @@ void main()
                 set: &descriptor_set,
                 binding: 0,
                 array_offset: 0,
-                descriptors: Some(in_descriptor),
+                descriptors: &[in_descriptor],
             };
 
             let out_descriptor_set_write = hal::pso::DescriptorSetWrite {
                 set: &descriptor_set,
                 binding: 1,
                 array_offset: 0,
-                descriptors: Some(out_descriptor),
+                descriptors: &[out_descriptor],
             };
 
             device.write_descriptor_sets(vec![in_descriptor_set_write, out_descriptor_set_write]);
@@ -418,7 +455,7 @@ void main()
         command_buffer.begin();
         command_buffer.bind_compute_pipeline(pipeline);
         command_buffer.bind_compute_descriptor_sets(pipeline_layout, 0, descriptor_sets, &[]);
-        command_buffer.dispatch([buffer_length, 1, 1]);
+        command_buffer.dispatch([buffer_length / 256, 1, 1]);
         command_buffer.finish();
 
         command_buffer
@@ -443,13 +480,11 @@ void main()
     }
 
     unsafe fn check_result(&self) {
-        for j in 0isize..(self.buffer_size as isize) {
-            if ptr::read(self.host_memory.offset(j)) != ptr::read(self.host_memory.offset(j + (self.buffer_size as isize))) {
-                println!("Check failed: difference exists between payload and result.");
-                return;
-            }
+        let base = self.host_memory.add(self.buffer_size as usize);
+        for j in 0..16 {
+            let x = ptr::read((base as *const u32).add(j as usize));
+            //println!("{}: {}", j, x);
         }
-        println!("Check successful: payload is the same as result.");
     }
 
     unsafe fn clean_up(self) {
