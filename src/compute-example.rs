@@ -9,7 +9,7 @@ extern crate gfx_hal as hal;
 extern crate glsl_to_spirv;
 extern crate rand;
 extern crate shaderc;
-extern crate winit;
+extern crate png;
 #[macro_use]
 extern crate lazy_static;
 
@@ -20,6 +20,11 @@ use hal::{
     DescriptorPool, Device, Features, Gpu, Instance, PhysicalDevice, QueueFamily,
 };
 use std::{mem, ptr};
+
+use std::path::Path;
+use std::fs::File;
+use std::io::BufWriter;
+use png::HasParameters;
 
 lazy_static! {
     static ref START_TIME: std::time::Instant = std::time::Instant::now();
@@ -38,12 +43,11 @@ fn main() {
         log_elapsed("init...");
         let mut application = ComputeApplication::init();
         log_elapsed("fill_payload...");
-
         application.fill_payload();
         log_elapsed("execute_compute...");
         application.execute_compute();
-        log_elapsed("check_result...");
-        application.check_result();
+        log_elapsed("writing png...");
+        application.write_png();
         log_elapsed("clean_up...");
         application.clean_up();
         log_elapsed("done...");
@@ -87,6 +91,7 @@ impl ComputeApplication {
         log_elapsed("adapter picked");
         let (device, command_queues, queue_type, qf_id) =
             ComputeApplication::create_device_with_compute_queue(&mut adapter);
+        log_elapsed("device created, creating io buffers");
         let (buffer_length, buffer_size, memory, in_buffer, out_buffer, host_memory) =
             ComputeApplication::create_io_buffers(&mut adapter, &device);
         let (descriptor_set_layout, pipeline_layout, compute_pipeline) =
@@ -99,6 +104,7 @@ impl ComputeApplication {
             &out_buffer,
         );
 
+        log_elapsed("creating command pool");
         let mut command_pool = ComputeApplication::create_command_pool(&device, queue_type, qf_id);
 
         let command_buffer = ComputeApplication::create_command_buffer(
@@ -162,6 +168,7 @@ impl ComputeApplication {
         }
         */
         let mut adapters = instance.enumerate_adapters();
+        adapters.drain(..0); // 0 = NVidia 1060, 1 = Intel HD 630
         for adapter in adapters {
             if ComputeApplication::is_adapter_suitable(&adapter) {
                 return adapter;
@@ -178,9 +185,9 @@ impl ComputeApplication {
         queue::QueueType,
         queue::family::QueueFamilyId,
     ) {
-//        for family in &adapter.queue_families {
-//            log_elapsed(&format!("family: {:?}", family));
-//        }
+        for family in &adapter.queue_families {
+            log_elapsed(&format!("family: {:?}", family));
+        }
         let family = adapter
             .queue_families
             .iter()
@@ -218,8 +225,8 @@ impl ComputeApplication {
         <back::Backend as Backend>::Buffer,
         *mut u8,
     ) {
-        let buffer_length: u32 = 16384;
-        let buffer_size: u64 = ((mem::size_of::<i32>() as u32)  * buffer_length) as u64;
+        let buffer_length: u32 = 8_388_608;
+        let buffer_size: u64 = ((mem::size_of::<i32>() as u32) * buffer_length) as u64;
         let memory_size: u64 = 2 * buffer_size;
 
         let mut in_buffer = device
@@ -283,23 +290,77 @@ impl ComputeApplication {
         <back::Backend as Backend>::ComputePipeline,
     ) {
         let source = "#version 450
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
 
 layout(binding = 0, std430) buffer _4_2
 {
-    int a[16384];
+    // This buffer should probably be smaller
+    uint a[8388608];
 } input_buff;
 
 layout(binding = 1, std430) buffer _4_3
 {
-    int a[16384];
+    uint a[8388608];
 } output_buff;
 
-shared int foo;
+shared uint shbuf[2048];
+
+uint pack(vec4 rgba) {
+    vec4 a = floor(0.5 + rgba * 255.0);
+    return uint(a.x) | (uint(a.y) << 8) | (uint(a.z) << 16) | (uint(a.w) << 24);
+}
+
+vec4 unpack(uint rgba) {
+    vec4 a = vec4(rgba & 0xff, (rgba >> 8) & 0xff, (rgba >> 16) & 0xff, (rgba >> 24) & 0xff);
+    return a * (1.0 / 255.0);
+}
 
 void main()
 {
-    output_buff.a[gl_GlobalInvocationID.x] = int(gl_LocalInvocationID.x);
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (gl_LocalInvocationID.x == 0 && gl_LocalInvocationID.y == 0) {
+        uint global_ixs = 0;
+        uint shared_ix = 0;
+        bool running = true;
+        while (running) {
+            uint op = input_buff.a[global_ix++];
+            switch (op) {
+                case 0:
+                    shbuf[shared_ix++] = op;
+                    running = false;
+                    break;
+                case 1:
+                    shbuf[shared_ix++] = op;
+                    shbuf[shared_ix++] = input_buff.a[global_ix++]; // cx
+                    shbuf[shared_ix++] = input_buff.a[global_ix++]; // cy
+                    shbuf[shared_ix++] = input_buff.a[global_ix++]; // r
+                    shbuf[shared_ix++] = input_buff.a[global_ix++]; // rgba
+                    break;
+            }
+        }
+    }
+    barrier();
+    float fx = x;
+    float fy = y;
+    vec4 rgba = vec4(fx / 4096.0, fy / 2048.0, 0.5, 1.0);
+    uint shared_ix = 0;
+    uint op;
+    while ((op = shbuf[shared_ix++]) != 0) {
+        switch (op) {
+            case 1:
+                // filled circle
+                float dx = fx - uintBitsToFloat(shbuf[shared_ix++]);
+                float dy = fy - uintBitsToFloat(shbuf[shared_ix++]);
+                float r = uintBitsToFloat(shbuf[shared_ix++]);
+                float a = clamp((r * r - dx * dx - dy * dy) / (2 * r + 1), 0, 1);
+                vec4 src = unpack(shbuf[shared_ix++]) * a;
+                rgba = src + rgba * (1 - src.w);
+                break;
+        }
+    }
+    uint width = 4096; // TODO: make this a parameter
+    output_buff.a[y * width + x] = pack(rgba);
 }";
 
         log_elapsed("compiling...");
@@ -439,7 +500,7 @@ void main()
     }
 
     unsafe fn create_command_buffer<'a>(
-        buffer_length: u32,
+        _buffer_length: u32,
         command_pool: &'a mut pool::CommandPool<back::Backend, Compute>,
         descriptor_sets: &[<back::Backend as Backend>::DescriptorSet],
         pipeline_layout: &'a <back::Backend as Backend>::PipelineLayout,
@@ -455,36 +516,51 @@ void main()
         command_buffer.begin();
         command_buffer.bind_compute_pipeline(pipeline);
         command_buffer.bind_compute_descriptor_sets(pipeline_layout, 0, descriptor_sets, &[]);
-        command_buffer.dispatch([buffer_length / 256, 1, 1]);
+        command_buffer.dispatch([128, 64, 1]);
         command_buffer.finish();
 
         command_buffer
     }
 
     unsafe fn execute_compute(&mut self) {
+        log_elapsed("submitting compute");
         let calculation_completed_fence = self.device.create_fence(false).unwrap();
         self.command_queues[0].submit_nosemaphores(
             std::iter::once(&self.command_buffer),
             Some(&calculation_completed_fence),
         );
+        log_elapsed("submitted, waiting");
         self.device
             .wait_for_fence(&calculation_completed_fence, std::u64::MAX)
             .unwrap();
         self.device.destroy_fence(calculation_completed_fence);
+        log_elapsed("done");
     }
 
     unsafe fn fill_payload(&mut self) {
-        for j in 0isize..(self.buffer_size as isize) {
-            ptr::copy(&rand::random::<u8>(), self.host_memory.offset(j), 1);
+        let mut d = DisplayListBuilder::new(self.host_memory as *mut u32);
+        for _ in 0..400 {
+            let cx = rand::random::<f32>() * 4096.0;
+            let cy = rand::random::<f32>() * 2048.0;
+            let r = rand::random::<f32>() * 100.0;
+            let rgba = rand::random::<u32>() | 0xff000000;
+            d.circle(cx, cy, r, rgba);
         }
+        d.end();
     }
 
-    unsafe fn check_result(&self) {
+    unsafe fn write_png(&self) {
+        let width = 4096;
+        let height = 2048;
+        let path = Path::new("out.png");
+        let file = File::create(path).unwrap();
+        let w = BufWriter::new(file);
+        let mut encoder = png::Encoder::new(w, width, height);
+        encoder.set(png::ColorType::RGBA);
+        let mut writer = encoder.write_header().unwrap();
         let base = self.host_memory.add(self.buffer_size as usize);
-        for j in 0..16 {
-            let x = ptr::read((base as *const u32).add(j as usize));
-            //println!("{}: {}", j, x);
-        }
+        let img_slice = std::slice::from_raw_parts(base, (width * height * 4) as usize);
+        writer.write_image_data(img_slice).unwrap();
     }
 
     unsafe fn clean_up(self) {
@@ -505,5 +581,38 @@ void main()
         device.destroy_buffer(self.in_buffer);
 
         device.free_memory(self.memory);
+    }
+}
+
+struct DisplayListBuilder {
+    buf: *mut u32,
+    ix: usize,
+}
+
+impl DisplayListBuilder {
+    pub fn new(buf: *mut u32) -> DisplayListBuilder {
+        DisplayListBuilder { buf, ix: 0 }
+    }
+
+    pub unsafe fn write_u32(&mut self, x: u32) {
+        ptr::write(self.buf.add(self.ix), x);
+        self.ix += 1;
+    }
+
+    pub unsafe fn write_f32(&mut self, x: f32) {
+        ptr::write(self.buf.add(self.ix) as *mut f32, x);
+        self.ix += 1;
+    }
+
+    pub unsafe fn end(&mut self) {
+        self.write_u32(0);
+    }
+
+    pub unsafe fn circle(&mut self, cx: f32, cy: f32, r: f32, rgba: u32) {
+        self.write_u32(1);
+        self.write_f32(cx);
+        self.write_f32(cy);
+        self.write_f32(r);
+        self.write_u32(rgba);
     }
 }
