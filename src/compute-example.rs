@@ -7,9 +7,9 @@ extern crate gfx_backend_metal as back;
 extern crate gfx_backend_vulkan as back;
 extern crate gfx_hal as hal;
 extern crate glsl_to_spirv;
+extern crate png;
 extern crate rand;
 extern crate shaderc;
-extern crate png;
 #[macro_use]
 extern crate lazy_static;
 
@@ -21,10 +21,10 @@ use hal::{
 };
 use std::{mem, ptr};
 
-use std::path::Path;
+use png::HasParameters;
 use std::fs::File;
 use std::io::BufWriter;
-use png::HasParameters;
+use std::path::Path;
 
 lazy_static! {
     static ref START_TIME: std::time::Instant = std::time::Instant::now();
@@ -67,7 +67,7 @@ impl QueueFamilyIds {
 
 struct ComputeApplication {
     command_buffer:
-    command::CommandBuffer<back::Backend, Compute, command::OneShot, command::Primary>,
+        command::CommandBuffer<back::Backend, Compute, command::OneShot, command::Primary>,
     command_pool: pool::CommandPool<back::Backend, Compute>,
     descriptor_pool: <back::Backend as Backend>::DescriptorPool,
     compute_pipeline: <back::Backend as Backend>::ComputePipeline,
@@ -256,9 +256,7 @@ impl ComputeApplication {
             .unwrap()
             .into();
 
-        let memory = device
-            .allocate_memory(memory_type_id, memory_size)
-            .unwrap();
+        let memory = device.allocate_memory(memory_type_id, memory_size).unwrap();
 
         device
             .bind_buffer_memory(&memory, 0, &mut in_buffer)
@@ -268,9 +266,7 @@ impl ComputeApplication {
             .unwrap();
 
         // you can only ever map device memory to host memory once!
-        let host_memory = device
-            .map_memory(&memory, (0 as u64)..memory_size)
-            .unwrap();
+        let host_memory = device.map_memory(&memory, (0 as u64)..memory_size).unwrap();
 
         (
             buffer_length,
@@ -289,79 +285,99 @@ impl ComputeApplication {
         <back::Backend as Backend>::PipelineLayout,
         <back::Backend as Backend>::ComputePipeline,
     ) {
-        let source = "#version 450
-layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+        let source = "
+        #version 450
+        layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
 
-layout(binding = 0, std430) buffer _4_2
-{
-    // This buffer should probably be smaller
-    uint a[8388608];
-} input_buff;
+        layout(binding = 0, std430) buffer InputDataBuffer
+            {
+                // This buffer should probably be smaller
+                uint data[8388608];
+            } input_buff;
 
-layout(binding = 1, std430) buffer _4_3
-{
-    uint a[8388608];
-} output_buff;
+        layout(binding = 1, std430) buffer OutputDataBuffer
+            {
+                uint data[8388608];
+            } output_buff;
 
-shared uint shbuf[2048];
+        shared uint shbuf[2048];
 
-uint pack(vec4 rgba) {
-    vec4 a = floor(0.5 + rgba * 255.0);
-    return uint(a.x) | (uint(a.y) << 8) | (uint(a.z) << 16) | (uint(a.w) << 24);
-}
+        uint pack(vec4 rgba) {
+            vec4 int_form = floor(0.5 + rgba * 255.0);
+            return uint(int_form.x) | (uint(int_form.y) << 8) | (uint(int_form.z) << 16) | (uint(int_form.w) << 24);
+        }
 
-vec4 unpack(uint rgba) {
-    vec4 a = vec4(rgba & 0xff, (rgba >> 8) & 0xff, (rgba >> 16) & 0xff, (rgba >> 24) & 0xff);
-    return a * (1.0 / 255.0);
-}
+        vec4 unpack(uint rgba) {
+            vec4 vec_form = vec4((rgba >> 24) & 0xff, (rgba >> 16) & 0xff, (rgba >> 8) & 0xff, rgba & 0xff);
+            return vec_form * (1.0 / 255.0);
+        }
 
-void main()
-{
-    uint x = gl_GlobalInvocationID.x;
-    uint y = gl_GlobalInvocationID.y;
-    if (gl_LocalInvocationID.x == 0 && gl_LocalInvocationID.y == 0) {
-        uint global_ixs = 0;
-        uint shared_ix = 0;
-        bool running = true;
-        while (running) {
-            uint op = input_buff.a[global_ix++];
-            switch (op) {
-                case 0:
-                    shbuf[shared_ix++] = op;
-                    running = false;
-                    break;
-                case 1:
-                    shbuf[shared_ix++] = op;
-                    shbuf[shared_ix++] = input_buff.a[global_ix++]; // cx
-                    shbuf[shared_ix++] = input_buff.a[global_ix++]; // cy
-                    shbuf[shared_ix++] = input_buff.a[global_ix++]; // r
-                    shbuf[shared_ix++] = input_buff.a[global_ix++]; // rgba
-                    break;
+        float mask_circle(float dx, float dy, float r) {
+            if (dx*dx + dy*dy > r*r) {
+                return 0.0;
+            }
+            return 1.0;
+        }
+
+        vec4 determine_pixel_rgba(vec4 src, vec4 dst) {
+            float a = src.w + dst.w*(1 - src.w);
+            if (a > 0.0000000001) {
+                float b = dst.w*(1 - src.w);
+                return vec4((src.x*src.w + dst.x*b)/a,
+                            (src.y*src.w + dst.y*b)/a,
+                            (src.z*src.w + dst.z*b)/a,
+                            a);
+            } else {
+                return vec4(0.0, 0.0, 0.0, 0.0);
             }
         }
-    }
-    barrier();
-    float fx = x;
-    float fy = y;
-    vec4 rgba = vec4(fx / 4096.0, fy / 2048.0, 0.5, 1.0);
-    uint shared_ix = 0;
-    uint op;
-    while ((op = shbuf[shared_ix++]) != 0) {
-        switch (op) {
-            case 1:
-                // filled circle
-                float dx = fx - uintBitsToFloat(shbuf[shared_ix++]);
-                float dy = fy - uintBitsToFloat(shbuf[shared_ix++]);
-                float r = uintBitsToFloat(shbuf[shared_ix++]);
-                float a = clamp((r * r - dx * dx - dy * dy) / (2 * r + 1), 0, 1);
-                vec4 src = unpack(shbuf[shared_ix++]) * a;
-                rgba = src + rgba * (1 - src.w);
-                break;
-        }
-    }
-    uint width = 4096; // TODO: make this a parameter
-    output_buff.a[y * width + x] = pack(rgba);
-}";
+
+        void main()
+        {
+            uint x = gl_GlobalInvocationID.x;
+            uint y = gl_GlobalInvocationID.y;
+            if (gl_LocalInvocationID.x == 0 && gl_LocalInvocationID.y == 0) {
+                uint global_ix = 0;
+                uint shared_ix = 0;
+                bool running = true;
+                while (running) {
+                    uint op = input_buff.data[global_ix++];
+                    switch (op) {
+                        case 0:
+                            shbuf[shared_ix++] = op;
+                        running = false;
+                        break;
+                        case 1:
+                            shbuf[shared_ix++] = op;
+                        shbuf[shared_ix++] = input_buff.data[global_ix++]; // cx
+                        shbuf[shared_ix++] = input_buff.data[global_ix++]; // cy
+                        shbuf[shared_ix++] = input_buff.data[global_ix++]; // r
+                        shbuf[shared_ix++] = input_buff.data[global_ix++]; // rgba
+                        break;
+                    }
+                }
+            }
+            barrier();
+            float fx = x;
+            float fy = y;
+            vec4 dst = vec4(1.0, 1.0, 1.0, 1.0);
+            uint shared_ix = 0;
+            uint op;
+            while ((op = shbuf[shared_ix++]) != 0) {
+                switch (op) {
+                    case 1:
+                        // filled circle
+                        float dx = fx - uintBitsToFloat(shbuf[shared_ix++]);
+                        float dy = fy - uintBitsToFloat(shbuf[shared_ix++]);
+                        float r = uintBitsToFloat(shbuf[shared_ix++]);
+                        vec4 src = unpack(shbuf[shared_ix++])*mask_circle(dx, dy, r);
+                        dst = determine_pixel_rgba(src, dst);
+                        break;
+                }
+            }
+            uint width = 4096; // TODO: make this a parameter
+            output_buff.data[y * width + x] = pack(dst);
+        }";
 
         log_elapsed("compiling...");
         let mut compiler = shaderc::Compiler::new().unwrap();
@@ -374,7 +390,10 @@ void main()
                 None,
             )
             .unwrap();
-        log_elapsed(&format!("done: {} bytes", compilation_result.as_binary_u8().len()));
+        log_elapsed(&format!(
+            "done: {} bytes",
+            compilation_result.as_binary_u8().len()
+        ));
 
         let shader_module = device
             .create_shader_module(compilation_result.as_binary_u8())
@@ -468,14 +487,10 @@ void main()
 
         let descriptor_set = descriptor_pool.allocate_set(descriptor_set_layout).unwrap();
 
-        let in_descriptor =
-            hal::pso::Descriptor::Buffer(in_buffer, None..None);
+        let in_descriptor = hal::pso::Descriptor::Buffer(in_buffer, None..None);
 
         // how much of the out_buffer do we want to use? all of it, so None..None for "no range", i.e. everything
-        let out_descriptor = hal::pso::Descriptor::Buffer(
-            out_buffer,
-            None..None,
-        );
+        let out_descriptor = hal::pso::Descriptor::Buffer(out_buffer, None..None);
 
         // how to know that I should be using Some(descriptor) here, based on docs?
         {
@@ -539,11 +554,18 @@ void main()
 
     unsafe fn fill_payload(&mut self) {
         let mut d = DisplayListBuilder::new(self.host_memory as *mut u32);
-        for _ in 0..400 {
-            let cx = rand::random::<f32>() * 4096.0;
-            let cy = rand::random::<f32>() * 2048.0;
-            let r = rand::random::<f32>() * 100.0;
-            let rgba = rand::random::<u32>() | 0xff000000;
+        let rgbas = vec![
+            convert_rgba_to_u32(0.0, 0.0, 1.0, 0.1),
+            convert_rgba_to_u32(0.0, 0.0, 1.0, 0.2),
+            convert_rgba_to_u32(0.0, 0.0, 1.0, 0.3),
+            convert_rgba_to_u32(0.0, 0.0, 1.0, 0.4),
+            convert_rgba_to_u32(0.0, 0.0, 1.0, 0.5),
+        ];
+        for i in 0..5 {
+            let cx = (-450.0 + (i as f32) * 200.0) + (0.5 * 4096.0);
+            let cy = 0.0 + (0.5 * 2048.0);
+            let r = 100.0;
+            let rgba = rgbas[i];
             d.circle(cx, cy, r, rgba);
         }
         d.end();
@@ -582,6 +604,17 @@ void main()
 
         device.free_memory(self.memory);
     }
+}
+
+fn map_colour_fraction_to_integer(input: f32) -> u32 {
+    (input * 255.0).ceil() as u32
+}
+
+fn convert_rgba_to_u32(r: f32, g: f32, b: f32, a: f32) -> u32 {
+    map_colour_fraction_to_integer(a) << 0
+        | map_colour_fraction_to_integer(b) << 8
+        | map_colour_fraction_to_integer(g) << 16
+        | map_colour_fraction_to_integer(r) << 24
 }
 
 struct DisplayListBuilder {
